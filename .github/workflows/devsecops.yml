@@ -1,0 +1,375 @@
+# =============================================================================
+# DevSecOps Pipeline — Multi-Cloud (AWS + Azure)
+#
+# Zero-trust auth: OIDC only. No AWS access keys, no Azure client secrets.
+# The only values stored in GitHub are non-secret identifiers (role ARNs,
+# Entra client/tenant/subscription IDs) kept in GitHub Environment variables.
+#
+# Fail-fast: Stage 1 security gates run in parallel; `needs:` blocks every
+# downstream stage until all gates are green. Scanners are configured to
+# exit non-zero on threshold violations.
+# =============================================================================
+name: DevSecOps Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least-privilege default; jobs elevate individually.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: devsecops-demo
+  ACR_NAME: devsecopsdemoacr        # <acr-name>.azurecr.io
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ===========================================================================
+  # STAGE 1 — SECURITY GATES (parallel, fail-fast)
+  # ===========================================================================
+
+  # ---- Gate 1: Secrets detection (full git history) -------------------------
+  secrets-scan:
+    name: "Gate: Secrets (Gitleaks)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # full history — catches secrets deleted in later commits
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE only required for org-owned repos:
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        # .gitleaks.toml at repo root is picked up automatically.
+        # Any finding => non-zero exit => pipeline dead.
+
+  # ---- Gate 2: IaC scanning (Checkov → SARIF) --------------------------------
+  iac-scan:
+    name: "Gate: IaC (Checkov)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write        # SARIF upload to GitHub Security tab
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          config_file: .checkov.yaml
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          soft_fail: false          # hard gate — failed policy = failed job
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()                # findings visible even when the gate fails
+        with:
+          sarif_file: checkov.sarif
+          category: checkov-iac
+
+  # ---- Gate 3a: SAST — Python (Semgrep + Bandit) -----------------------------
+  sast-python:
+    name: "Gate: SAST Python"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Semgrep (Python rulesets)
+        run: |
+          semgrep scan app-python/ \
+            --config p/python \
+            --config p/owasp-top-ten \
+            --config p/secrets \
+            --sarif --output semgrep-python.sarif \
+            --error                  # exit 1 on any blocking finding
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep-python.sarif
+          category: semgrep-python
+
+  # ---- Gate 3b: SAST — Java (Semgrep) ----------------------------------------
+  sast-java:
+    name: "Gate: SAST Java"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Semgrep (Java rulesets)
+        run: |
+          semgrep scan app-java/ \
+            --config p/java \
+            --config p/owasp-top-ten \
+            --config p/secrets \
+            --sarif --output semgrep-java.sarif \
+            --error
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep-java.sarif
+          category: semgrep-java
+
+  # ---- Gate 4a: SCA — Python (pip-audit) -------------------------------------
+  sca-python:
+    name: "Gate: SCA Python"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip                # pip dependency cache
+          cache-dependency-path: app-python/requirements.txt
+
+      - name: pip-audit
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          # --strict: unresolvable deps also fail; any known vuln => exit 1
+          pip-audit -r app-python/requirements.txt --strict --desc
+
+  # ---- Gate 4b: SCA — Java (OWASP Dependency-Check) --------------------------
+  sca-java:
+    name: "Gate: SCA Java"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven              # ~/.m2/repository cache
+
+      - name: Cache NVD database
+        uses: actions/cache@v4
+        with:
+          path: ~/.dependency-check-data
+          key: nvd-db-${{ github.run_id }}
+          restore-keys: nvd-db-
+
+      - name: OWASP Dependency-Check
+        working-directory: app-java
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}   # API key for NVD feed, not a cloud credential
+        run: |
+          mvn --batch-mode --no-transfer-progress \
+            org.owasp:dependency-check-maven:12.1.0:check \
+            -DnvdApiKey="${NVD_API_KEY}" \
+            -DdataDirectory="${HOME}/.dependency-check-data" \
+            -DfailBuildOnCVSS=7 \
+            -DsuppressionFiles=dependency-check-suppressions.xml \
+            -Dformats=HTML,JSON
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-check-report
+          path: app-java/target/dependency-check-report.*
+
+  # ===========================================================================
+  # STAGE 2 — BUILD + IMAGE SCAN + PUSH
+  # Blocked by ALL Stage 1 gates. Trivy gate sits between build and push:
+  # vulnerable image never reaches a registry.
+  # ===========================================================================
+  build-scan-push:
+    name: "Build & Scan: ${{ matrix.app }}"
+    runs-on: ubuntu-latest
+    needs: [secrets-scan, iac-scan, sast-python, sast-java, sca-python, sca-java]
+    permissions:
+      contents: read
+      id-token: write               # OIDC token for AWS + Azure federation
+      security-events: write
+    strategy:
+      fail-fast: true
+      matrix:
+        app: [app-python, app-java]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (local only — not pushed yet)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.app }}
+          load: true
+          push: false
+          tags: ${{ matrix.app }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,scope=${{ matrix.app }},mode=max
+
+      # ---- Gate 5: Image scan (Trivy) — blocks registry push ----------------
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: ${{ matrix.app }}:${{ env.IMAGE_TAG }}
+          format: sarif
+          output: trivy-${{ matrix.app }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"            # HIGH/CRITICAL => job fails, push never runs
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-${{ matrix.app }}.sarif
+          category: trivy-${{ matrix.app }}
+
+      # ---- Push only on main, only after scan passed -------------------------
+      - name: Configure AWS credentials (OIDC — no stored keys)
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        if: github.ref == 'refs/heads/main'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Azure login (OIDC federated credential — no client secret)
+        if: github.ref == 'refs/heads/main'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        if: github.ref == 'refs/heads/main'
+        run: az acr login --name "${{ env.ACR_NAME }}"
+
+      - name: Tag & push to ECR + ACR
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          ECR="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}-${{ matrix.app }}"
+          ACR="${{ env.ACR_NAME }}.azurecr.io/${{ env.ECR_REPOSITORY }}-${{ matrix.app }}"
+          for target in "$ECR" "$ACR"; do
+            docker tag "${{ matrix.app }}:${{ env.IMAGE_TAG }}" "${target}:${{ env.IMAGE_TAG }}"
+            docker push "${target}:${{ env.IMAGE_TAG }}"
+          done
+
+  # ===========================================================================
+  # STAGE 3 — DEPLOY (Terraform, OIDC, staging → production)
+  # ===========================================================================
+  deploy-staging:
+    name: "Deploy: Staging"
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: build-scan-push
+    environment: staging            # environment-scoped OIDC subject claim
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform apply (staging)
+        working-directory: terraform
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          terraform init -backend-config="key=staging/terraform.tfstate"
+          terraform fmt -check -recursive
+          terraform validate
+          terraform plan -var-file=environments/staging.tfvars -out=tfplan
+          terraform apply -auto-approve tfplan
+
+  deploy-production:
+    name: "Deploy: Production"
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: production         # configure required reviewers => manual approval gate
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PRODUCTION_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform apply (production)
+        working-directory: terraform
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          terraform init -backend-config="key=production/terraform.tfstate"
+          terraform plan -var-file=environments/production.tfvars -out=tfplan
+          terraform apply -auto-approve tfplan

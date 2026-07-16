@@ -1,0 +1,44 @@
+# =============================================================================
+# Gitleaks configuration — extends default ruleset, tunes false positives.
+# Philosophy: allowlist by PATH and PATTERN, never disable whole rules.
+# =============================================================================
+title = "DevSecOps secrets scanning policy"
+
+[extend]
+# Inherit the full default gitleaks ruleset; entries below only ADD or ALLOW.
+useDefault = true
+
+[allowlist]
+description = "Global allowlist — reviewed exceptions only"
+
+paths = [
+  # Dependency lockfiles: hashes trigger high-entropy detectors
+  '''package-lock\.json''',
+  '''poetry\.lock''',
+  '''Pipfile\.lock''',
+  # Test fixtures with intentionally fake credentials
+  '''(^|/)tests?/fixtures/''',
+  # Vendored third-party code (scanned upstream)
+  '''(^|/)vendor/''',
+  # Generated SARIF/reports from prior runs
+  '''\.sarif$''',
+]
+
+regexes = [
+  # Documented example placeholders
+  '''EXAMPLE_[A-Z0-9_]+''',
+  '''(?i)placeholder''',
+  # AWS's own documented dummy access key
+  '''AKIAIOSFODNN7EXAMPLE''',
+  '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',
+]
+
+# Inline escape hatch: a `#gitleaks:allow` comment on the flagged line
+# (visible in code review) suppresses a single finding.
+
+# ---- Custom rule: internal PAT format ---------------------------------------
+[[rules]]
+id = "internal-service-token"
+description = "Internal service tokens (svc_ prefix)"
+regex = '''svc_[a-zA-Z0-9]{32,}'''
+keywords = ["svc_"]

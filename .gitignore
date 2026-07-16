@@ -1,0 +1,28 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfplan
+tfplan
+override.tf
+override.tf.json
+.terraformrc
+terraform.rc
+
+# Scanner output
+*.sarif
+dependency-check-report.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Java / Maven
+target/
+*.class
+
+# OS
+.DS_Store

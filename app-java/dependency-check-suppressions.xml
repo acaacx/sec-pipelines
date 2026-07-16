@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OWASP Dependency-Check suppression file.
+  Every suppression MUST carry a justification and, ideally, a review date.
+  An empty file means zero accepted-risk CVEs — the strictest posture.
+-->
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+  <!--
+  Example (kept commented — uncomment only after security review):
+
+  <suppress>
+    <notes><![CDATA[
+      CVE-XXXX-XXXXX: not exploitable — vulnerable code path unused.
+      Reviewed: 2026-07-17. Re-review by: 2026-10-17.
+    ]]></notes>
+    <cve>CVE-XXXX-XXXXX</cve>
+  </suppress>
+  -->
+</suppressions>

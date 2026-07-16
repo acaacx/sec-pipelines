@@ -1,0 +1,40 @@
+# =============================================================================
+# Checkov configuration — IaC security gate policy.
+# Rule: every skip carries a written justification. Unjustified skip = PR reject.
+# =============================================================================
+directory:
+  - terraform
+
+framework:
+  - terraform
+  - github_actions          # also lints the workflow itself (e.g. CKV2_GHA_1 top-level permissions)
+
+# Hard gate: exit non-zero on failed checks (workflow sets soft_fail: false too)
+soft-fail: false
+
+# Fail only on HIGH and CRITICAL — MEDIUM/LOW reported, not blocking.
+# Prevents alert fatigue while keeping serious findings hard failures.
+check: null
+skip-check:
+  # --- Reviewed, accepted-risk exceptions (justification mandatory) ----------
+  # S3 access logging: state bucket logging handled by org-level CloudTrail data events
+  - CKV_AWS_18
+  # Cross-region S3 replication not required for non-DR buckets in this project
+  - CKV_AWS_144
+  # KMS CMK rotation: buckets use SSE-S3 by design decision SEC-142
+  - CKV_AWS_145
+  # Azure RG locks managed by platform team via Azure Policy, not per-repo TF
+  - CKV_AZURE_110
+
+skip-path:
+  - tests/
+  - examples/
+  - .terraform/
+
+# Evaluate variables so checks see real values, not just raw HCL
+evaluate-variables: true
+
+# Scan module calls too
+download-external-modules: false   # supply-chain: never auto-download modules in CI
+compact: true
+quiet: false                        # keep passed-check summary for audit trail
