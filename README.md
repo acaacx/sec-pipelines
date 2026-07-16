@@ -3,8 +3,32 @@
 Production-grade **multi-cloud DevSecOps pipeline** with secure infrastructure-as-code.
 
 Shift-left security gates, zero-trust OIDC authentication (no long-lived cloud
-credentials), and multi-cloud deploy (AWS + Azure) driven by GitHub Actions and
-Terraform.
+credentials), and multi-cloud deploy (AWS + Azure). Runs on **GitHub Actions,
+GitLab CI, and Jenkins** from one shared implementation.
+
+## Portable by design
+
+The security logic lives in `./scripts` and is exposed through a `Makefile`.
+Every CI platform is a thin wrapper that calls the same `make` targets, so the
+gates behave identically everywhere — only orchestration (job graph, OIDC login,
+approval gates) is platform-specific.
+
+```
+scripts/*.sh   →  Makefile targets  →  { .github/workflows/devsecops.yml
+                                         .gitlab-ci.yml
+                                         Jenkinsfile }
+```
+
+| Concern | GitHub Actions | GitLab CI | Jenkins |
+|---------|---------------|-----------|---------|
+| Gate logic | `make scan-*` | `make scan-*` | `make scan-*` |
+| Parallel gates | job fan-out | shared `scan` stage | `parallel {}` |
+| OIDC token | `configure-aws-credentials` / `azure/login` | `id_tokens:` | OIDC Provider plugin |
+| Token → creds | native action | `scripts/aws-oidc-login.sh` | `scripts/aws-oidc-login.sh` |
+| SARIF sink | Security tab | job artifacts | archived artifacts |
+| Prod gate | protected environment | `when: manual` | `input` step |
+
+Run any gate locally too: `make scan-secrets`, `make build-scan APP=app-python`, etc.
 
 ## Architecture — fail-fast enforcement
 
@@ -52,13 +76,33 @@ subscription IDs) live in GitHub Environment **variables**, not secrets.
 ## Layout
 
 ```
-.github/workflows/devsecops.yml   # full pipeline
-terraform/oidc_setup.tf           # AWS IAM OIDC + Entra federated identity
+Makefile                          # portable entry point (also for local dev)
+scripts/                          # shared gate/build/deploy/OIDC logic
+.github/workflows/devsecops.yml   # GitHub Actions wrapper
+.gitlab-ci.yml                    # GitLab CI wrapper
+Jenkinsfile                       # Jenkins wrapper
+terraform/oidc_setup.tf           # AWS IAM OIDC + Entra federated identity (GitHub)
+terraform/oidc_ci.tf              # GitLab + Jenkins OIDC (feature-flagged)
 terraform/environments/*.tfvars   # per-env non-secret vars
 .gitleaks.toml                    # secrets-scan tuning
 .checkov.yaml                     # IaC-scan tuning
 app-python/                       # sample Flask workload + Dockerfile
 app-java/                         # sample Spring Boot workload + Dockerfile
+```
+
+## Enabling GitLab / Jenkins OIDC
+
+`oidc_setup.tf` covers GitHub. For the other platforms, set the feature flags in
+`oidc_ci.tf` (each is a distinct OIDC issuer + subject claim, so each needs its
+own trust policy and Entra federated credential):
+
+```bash
+# GitLab
+terraform apply -var enable_gitlab=true -var gitlab_project_path=mygroup/sec-pipelines
+# Jenkins (issuer/subject from the OpenID Connect Provider plugin)
+terraform apply -var enable_jenkins=true \
+  -var jenkins_issuer=https://jenkins.example.com/oidc \
+  -var jenkins_subject='...'
 ```
 
 ## Setup

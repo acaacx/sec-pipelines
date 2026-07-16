@@ -1,0 +1,155 @@
+# =============================================================================
+# DevSecOps Pipeline — GitLab CI wrapper.
+#
+# Same shared logic as GitHub Actions and Jenkins: every job calls a `make`
+# target backed by ./scripts. GitLab-native bits: `id_tokens` for OIDC (no
+# stored cloud credentials) and `environment:` + manual gate for production.
+#
+# Fail-fast: stages run in order; a non-zero make target fails the stage and
+# stops everything downstream. Stage-1 jobs share a stage so they run in
+# parallel, exactly like the GHA gate fan-out.
+# =============================================================================
+stages:
+  - scan
+  - build
+  - deploy-staging
+  - deploy-production
+
+variables:
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: devsecops-demo
+  ACR_NAME: devsecopsdemoacr
+  IMAGE_TAG: $CI_COMMIT_SHA
+  # Non-secret identifiers -> set as GitLab CI/CD variables (not masked secrets
+  # for the IDs; they are not credentials). AWS_STAGING_ROLE_ARN,
+  # AWS_PRODUCTION_ROLE_ARN, AZURE_CLIENT_ID, AZURE_TENANT_ID,
+  # AZURE_SUBSCRIPTION_ID. NVD_API_KEY is the only real secret.
+
+default:
+  image: python:3.12-bookworm
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq make curl git openjdk-21-jre-headless >/dev/null
+    - make install
+
+# ---- Stage 1: security gates (parallel within the `scan` stage) -------------
+secrets-scan:
+  stage: scan
+  variables:
+    GIT_DEPTH: 0                  # full history for Gitleaks
+  script:
+    - make scan-secrets
+  artifacts:
+    when: always
+    paths: [gitleaks.sarif]
+
+iac-scan:
+  stage: scan
+  script:
+    - make scan-iac
+  artifacts:
+    when: always
+    paths: [results_sarif.sarif]
+
+sast-python:
+  stage: scan
+  script:
+    - make sast-python
+  artifacts:
+    when: always
+    paths: [semgrep-python.sarif]
+
+sast-java:
+  stage: scan
+  script:
+    - make sast-java
+  artifacts:
+    when: always
+    paths: [semgrep-java.sarif]
+
+sca-python:
+  stage: scan
+  script:
+    - make sca-python
+
+sca-java:
+  stage: scan
+  image: maven:3.9-eclipse-temurin-21
+  cache:
+    key: maven-$CI_COMMIT_REF_SLUG
+    paths: [.m2/repository]
+  variables:
+    MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  script:
+    - make sca-java              # requires NVD_API_KEY CI/CD variable
+  artifacts:
+    when: always
+    paths: [app-java/target/dependency-check-report.*]
+
+# ---- Stage 2: build + Trivy gate + push (blocked by the whole scan stage) ---
+build-scan-push:
+  stage: build
+  image: "docker:27"
+  services: ["docker:27-dind"]
+  parallel:
+    matrix:
+      - APP: [app-python, app-java]
+  # GitLab issues OIDC JWTs natively — no long-lived cloud credentials.
+  id_tokens:
+    AWS_OIDC_TOKEN:
+      aud: sts.amazonaws.com
+    AZURE_OIDC_TOKEN:
+      aud: api://AzureADTokenExchange
+  before_script:
+    - apk add --no-cache make bash aws-cli curl git py3-pip
+    - pip install --break-system-packages azure-cli >/dev/null 2>&1 || true
+    - make install
+  script:
+    - make build-scan APP=$APP
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        export AWS_ROLE_ARN="$AWS_STAGING_ROLE_ARN"
+        eval "$(scripts/aws-oidc-login.sh)"
+        scripts/azure-oidc-login.sh
+        scripts/push-image.sh "$APP" "$APP:$IMAGE_TAG"
+      fi
+  artifacts:
+    when: always
+    paths: [trivy-*.sarif]
+
+# ---- Stage 3: deploy (OIDC, staging -> production) --------------------------
+.deploy_template: &deploy
+  image: hashicorp/terraform:1.9.8
+  id_tokens:
+    AWS_OIDC_TOKEN:
+      aud: sts.amazonaws.com
+    AZURE_OIDC_TOKEN:
+      aud: api://AzureADTokenExchange
+  before_script:
+    - apk add --no-cache make bash aws-cli py3-pip curl
+    - pip install --break-system-packages azure-cli >/dev/null 2>&1 || true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+deploy-staging:
+  <<: *deploy
+  stage: deploy-staging
+  environment:
+    name: staging
+  script:
+    - export AWS_ROLE_ARN="$AWS_STAGING_ROLE_ARN"
+    - eval "$(scripts/aws-oidc-login.sh)"
+    - scripts/azure-oidc-login.sh
+    - make deploy-staging
+
+deploy-production:
+  <<: *deploy
+  stage: deploy-production
+  environment:
+    name: production
+  when: manual                    # manual approval gate before prod
+  allow_failure: false
+  script:
+    - export AWS_ROLE_ARN="$AWS_PRODUCTION_ROLE_ARN"
+    - eval "$(scripts/aws-oidc-login.sh)"
+    - scripts/azure-oidc-login.sh
+    - make deploy-production
